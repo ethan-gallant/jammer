@@ -36,15 +36,11 @@ Or as client:
 	rootCmd.PersistentFlags().BoolVarP(&debug, "debug", "d", false, "enable debug logging")
 	rootCmd.PersistentFlags().IntVarP(&timeout, "timeout", "t", 30, "connection timeout in seconds")
 
-	// Server command
 	var serverCmd = &cobra.Command{
 		Use:   "server",
 		Short: "Run in server mode",
 		Run: func(cmd *cobra.Command, args []string) {
 			log.Printf("Starting server on %s", localIP)
-			if debug {
-				log.Printf("Debug mode enabled")
-			}
 			conf := &Config{
 				Mode:       "server",
 				LocalAddr:  localIP,
@@ -52,19 +48,17 @@ Or as client:
 				Timeout:    timeout,
 				Debug:      debug,
 			}
-			runServer(conf)
+			if err := runImprovedServer(conf); err != nil {
+				log.Fatalf("Server error: %v", err)
+			}
 		},
 	}
 
-	// Client command
 	var clientCmd = &cobra.Command{
 		Use:   "client",
 		Short: "Run in client mode",
 		Run: func(cmd *cobra.Command, args []string) {
 			log.Printf("Starting client connecting to %s", remoteIP)
-			if debug {
-				log.Printf("Debug mode enabled")
-			}
 			conf := &Config{
 				Mode:       "client",
 				LocalAddr:  localIP,
@@ -72,7 +66,9 @@ Or as client:
 				Timeout:    timeout,
 				Debug:      debug,
 			}
-			runClient(conf)
+			if err := runImprovedClient(conf); err != nil {
+				log.Fatalf("Client error: %v", err)
+			}
 		},
 	}
 

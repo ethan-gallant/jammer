@@ -6,141 +6,149 @@ import (
 	"log"
 	"math/rand"
 	"net"
-	"os"
 	"sync"
 	"time"
 )
 
 const (
-	maxRetries   = 60
-	punchTimeout = 5 * time.Second
+	// More aggressive constants
+	maxRetries    = 100             // Increased from 60
+	maxPorts      = 10              // Try multiple ports around target
+	punchTimeout  = 2 * time.Second // Reduced timeout
+	punchInterval = 200 * time.Millisecond
+	messageSize   = 1024
 )
 
-func runServer(conf *Config) {
-	conn := setupUDPConnection(conf)
-	defer conn.Close()
-
-	log.Printf("🚀 Starting UDP hole punch server...")
-	log.Printf("📡 Local address: %s", conn.LocalAddr())
-	log.Printf("🎯 Target client: %s", conf.RemoteAddr)
-
-	// Establish hole punch
-	if err := performHolePunch(conn, conf); err != nil {
-		log.Fatalf("❌ Hole punch failed: %v", err)
-	}
-
-	log.Printf("✅ HOLE PUNCH SUCCESSFUL!")
-	log.Printf("📞 Connection established with %s", conf.RemoteAddr)
-	handleServerConnection(conn, conf)
+type Message struct {
+	Type    string // "PING", "PONG", "PUNCH", "READY"
+	ID      int    // Random identifier for this node
+	Port    int    // Sender's port
+	Payload string // Additional data if needed
 }
 
-func runClient(conf *Config) {
-	conn := setupUDPConnection(conf)
-	defer conn.Close()
-
-	log.Printf("🚀 Starting UDP hole punch client...")
-	log.Printf("📡 Local address: %s", conn.LocalAddr())
-	log.Printf("🎯 Target server: %s", conf.RemoteAddr)
-
-	// Establish hole punch
-	if err := performHolePunch(conn, conf); err != nil {
-		log.Fatalf("❌ Hole punch failed: %v", err)
-	}
-
-	log.Printf("✅ HOLE PUNCH SUCCESSFUL!")
-	log.Printf("📞 Connection established with %s", conf.RemoteAddr)
-	handleClientConnection(conn, conf)
+type PunchSession struct {
+	LocalAddr  *net.UDPAddr
+	RemoteAddr *net.UDPAddr
+	Conn       *net.UDPConn
+	ID         int
+	Mode       string
 }
 
-func setupUDPConnection(conf *Config) *net.UDPConn {
+func setupSession(conf *Config) (*PunchSession, error) {
 	laddr := conf.GetLocalUDPAddr()
-	conn, err := net.ListenUDP("udp4", laddr)
-	if err != nil {
-		log.Fatalf("Failed to create UDP socket: %v", err)
-	}
-	debugLog("Local UDP socket created on %s", laddr)
-	return conn
-}
-
-func performHolePunch(conn *net.UDPConn, conf *Config) error {
-	var wg sync.WaitGroup
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	success := make(chan bool, 1)
 	raddr := conf.GetRemoteUDPAddr()
 
-	// Start sender goroutine
+	// Generate random ID for this session
+	id := rand.Intn(10000)
+
+	conn, err := net.ListenUDP("udp4", laddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create UDP socket: %v", err)
+	}
+
+	return &PunchSession{
+		LocalAddr:  laddr,
+		RemoteAddr: raddr,
+		Conn:       conn,
+		ID:         id,
+		Mode:       conf.Mode,
+	}, nil
+}
+
+func (s *PunchSession) performAggressiveHolePunch(ctx context.Context) error {
+	var wg sync.WaitGroup
+	success := make(chan bool, 1)
+	basePort := s.RemoteAddr.Port
+
+	// Start aggressive sender
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		msg := fmt.Sprintf("HELLO-%d", os.Getpid())
+		msg := Message{
+			Type: "PUNCH",
+			ID:   s.ID,
+			Port: s.LocalAddr.Port,
+		}
 
 		for i := 0; i < maxRetries; i++ {
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				debugLog("📤 Sending punch message (%d/%d): %s", i+1, maxRetries, msg)
-				if _, err := conn.WriteToUDP([]byte(msg), raddr); err != nil {
-					log.Printf("Send error: %v", err)
+				// Try multiple ports around the target port
+				for portOffset := 0; portOffset < maxPorts; portOffset++ {
+					targetAddr := *s.RemoteAddr
+					targetAddr.Port = basePort + portOffset
+
+					data := fmt.Sprintf("%+v", msg)
+					s.Conn.WriteToUDP([]byte(data), &targetAddr)
+
+					// Also try symmetric port
+					if portOffset > 0 {
+						targetAddr.Port = basePort - portOffset
+						s.Conn.WriteToUDP([]byte(data), &targetAddr)
+					}
 				}
-				time.Sleep(time.Duration(1000+rand.Intn(1000)) * time.Millisecond)
+
+				time.Sleep(punchInterval)
 			}
 		}
 	}()
 
-	// Start receiver goroutine
-	errCh := make(chan error, 1)
+	// Start aggressive receiver
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 1024)
-		readCount := 0
+		buffer := make([]byte, messageSize)
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				conn.SetReadDeadline(time.Now().Add(punchTimeout))
-				n, raddr, err := conn.ReadFromUDP(buf)
+				s.Conn.SetReadDeadline(time.Now().Add(punchTimeout))
+				n, remoteAddr, err := s.Conn.ReadFromUDP(buffer)
+
 				if err != nil {
 					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						readCount++
-						if readCount%5 == 0 {
-							debugLog("😴 Still waiting for response... (%d attempts)", readCount)
-						}
 						continue
 					}
-					errCh <- fmt.Errorf("read error: %v", err)
-					return
-				}
-
-				msg := string(buf[:n])
-				debugLog("📥 Received message: %s from %s", msg, raddr)
-
-				if raddr.String() != conf.GetRemoteUDPAddr().String() {
-					debugLog("⚠️  Ignoring message from unknown sender: %s", raddr)
+					log.Printf("Read error: %v", err)
 					continue
 				}
 
-				if n >= 5 && (msg[:5] == "HELLO" || msg[:5] == "READY") {
-					// Send confirmation
-					response := "READY-" + fmt.Sprint(os.Getpid())
-					debugLog("📤 Sending confirmation: %s", response)
-					conn.WriteToUDP([]byte(response), raddr)
+				// Process received message
+				var msg Message
+				fmt.Sscanf(string(buffer[:n]), "%+v", &msg)
 
-					// If we get here, hole punch worked!
+				// Validate message
+				if msg.Type == "PUNCH" || msg.Type == "READY" {
+					log.Printf("📥 Received %s from %v (ID: %d)", msg.Type, remoteAddr, msg.ID)
+
+					// Send confirmation
+					response := Message{
+						Type: "READY",
+						ID:   s.ID,
+						Port: s.LocalAddr.Port,
+					}
+					data := fmt.Sprintf("%+v", response)
+					s.Conn.WriteToUDP([]byte(data), remoteAddr)
+
+					// Update remote address if different
+					if remoteAddr.Port != s.RemoteAddr.Port {
+						log.Printf("🔄 Updating remote port from %d to %d",
+							s.RemoteAddr.Port, remoteAddr.Port)
+						s.RemoteAddr = remoteAddr
+					}
+
 					success <- true
-					cancel() // Stop sender goroutine
 					return
 				}
 			}
 		}
 	}()
 
-	// Wait for completion or timeout
+	// Wait with timeout
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -148,82 +156,107 @@ func performHolePunch(conn *net.UDPConn, conf *Config) error {
 	}()
 
 	select {
-	case err := <-errCh:
-		return fmt.Errorf("punch failed: %v", err)
 	case <-success:
+		log.Printf("✅ Hole punch successful! Connection established with %v", s.RemoteAddr)
 		return nil
-	case <-time.After(time.Duration(conf.Timeout) * time.Second):
-		cancel()
-		return fmt.Errorf("hole punch timed out after %d seconds - check if both sides are running and ports are correct", conf.Timeout)
+	case <-time.After(time.Duration(30) * time.Second):
+		return fmt.Errorf("hole punch timed out")
 	}
 }
 
-func handleServerConnection(conn *net.UDPConn, conf *Config) {
-	buf := make([]byte, 4096)
-	log.Printf("🎮 Server ready - waiting for data...")
+func (s *PunchSession) startKeepalive() {
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
 
+		for range ticker.C {
+			msg := Message{
+				Type: "PING",
+				ID:   s.ID,
+				Port: s.LocalAddr.Port,
+			}
+			data := fmt.Sprintf("%+v", msg)
+			s.Conn.WriteToUDP([]byte(data), s.RemoteAddr)
+		}
+	}()
+}
+
+func runImprovedServer(conf *Config) error {
+	session, err := setupSession(conf)
+	if err != nil {
+		return err
+	}
+	defer session.Conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(conf.Timeout)*time.Second)
+	defer cancel()
+
+	// Perform hole punching
+	if err := session.performAggressiveHolePunch(ctx); err != nil {
+		return err
+	}
+
+	// Start keepalive
+	session.startKeepalive()
+
+	// Handle data transfer
+	buffer := make([]byte, messageSize)
 	for {
-		conn.SetReadDeadline(time.Now().Add(time.Duration(conf.Timeout) * time.Second))
-		n, raddr, err := conn.ReadFromUDP(buf)
+		n, addr, err := session.Conn.ReadFromUDP(buffer)
 		if err != nil {
-			if os.IsTimeout(err) {
-				debugLog("Read timeout, continuing...")
+			log.Printf("Read error: %v", err)
+			continue
+		}
+
+		// Echo data back
+		session.Conn.WriteToUDP(buffer[:n], addr)
+	}
+}
+
+func runImprovedClient(conf *Config) error {
+	session, err := setupSession(conf)
+	if err != nil {
+		return err
+	}
+	defer session.Conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(conf.Timeout)*time.Second)
+	defer cancel()
+
+	// Perform hole punching
+	if err := session.performAggressiveHolePunch(ctx); err != nil {
+		return err
+	}
+
+	// Start keepalive
+	session.startKeepalive()
+
+	// Start ping/pong test
+	for {
+		msg := fmt.Sprintf("PING %d", time.Now().UnixNano())
+		if _, err := session.Conn.WriteToUDP([]byte(msg), session.RemoteAddr); err != nil {
+			log.Printf("Write error: %v", err)
+			continue
+		}
+
+		// Wait for response
+		buffer := make([]byte, messageSize)
+		session.Conn.SetReadDeadline(time.Now().Add(time.Second))
+		n, _, err := session.Conn.ReadFromUDP(buffer)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("⚠️ Response timeout")
 				continue
 			}
-			log.Printf("❌ Read error: %v", err)
-			return
+			log.Printf("Read error: %v", err)
+			continue
 		}
 
-		data := string(buf[:n])
-		debugLog("📥 Received %d bytes from %s: %s", n, raddr, data)
-
-		// Echo back
-		_, err = conn.WriteToUDP(buf[:n], raddr)
-		if err != nil {
-			log.Printf("❌ Write error: %v", err)
-			return
+		response := string(buffer[:n])
+		if response == msg {
+			log.Printf("✅ Ping successful!")
 		}
-		debugLog("📤 Echoed data back to %s", raddr)
-	}
-}
 
-func handleClientConnection(conn *net.UDPConn, conf *Config) {
-	raddr := conf.GetRemoteUDPAddr()
-	buf := make([]byte, 4096)
-
-	// Simple ping/pong loop
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
-	log.Printf("🏓 Starting ping/pong test...")
-	for {
-		select {
-		case <-ticker.C:
-			msg := fmt.Sprintf("PING %d", time.Now().UnixNano())
-			debugLog("📤 Sending: %s", msg)
-
-			_, err := conn.WriteToUDP([]byte(msg), raddr)
-			if err != nil {
-				log.Printf("❌ Write error: %v", err)
-				return
-			}
-
-			conn.SetReadDeadline(time.Now().Add(time.Duration(conf.Timeout) * time.Second))
-			n, _, err := conn.ReadFromUDP(buf)
-			if err != nil {
-				if os.IsTimeout(err) {
-					log.Printf("⚠️  Response timeout")
-					continue
-				}
-				log.Printf("❌ Read error: %v", err)
-				return
-			}
-
-			response := string(buf[:n])
-			debugLog("📥 Got response: %s", response)
-			if response == msg {
-				log.Printf("✅ Ping successful! Round trip complete")
-			}
-		}
+		time.Sleep(time.Second)
 	}
 }
