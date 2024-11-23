@@ -10,15 +10,6 @@ import (
 	"time"
 )
 
-const (
-	// More aggressive constants
-	maxRetries    = 100             // Increased from 60
-	maxPorts      = 10              // Try multiple ports around target
-	punchTimeout  = 2 * time.Second // Reduced timeout
-	punchInterval = 200 * time.Millisecond
-	messageSize   = 1024
-)
-
 type Message struct {
 	Type    string // "PING", "PONG", "PUNCH", "READY"
 	ID      int    // Random identifier for this node
@@ -60,6 +51,7 @@ func (s *PunchSession) performAggressiveHolePunch(ctx context.Context) error {
 	success := make(chan bool, 1)
 	basePort := s.RemoteAddr.Port
 
+	interval := time.Duration(punchInterval) * time.Millisecond
 	// Start aggressive sender
 	wg.Add(1)
 	go func() {
@@ -90,11 +82,12 @@ func (s *PunchSession) performAggressiveHolePunch(ctx context.Context) error {
 					}
 				}
 
-				time.Sleep(punchInterval)
+				time.Sleep(interval)
 			}
 		}
 	}()
 
+	timeout := time.Duration(punchTimeout) * time.Millisecond
 	// Start aggressive receiver
 	wg.Add(1)
 	go func() {
@@ -106,7 +99,7 @@ func (s *PunchSession) performAggressiveHolePunch(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			default:
-				s.Conn.SetReadDeadline(time.Now().Add(punchTimeout))
+				s.Conn.SetReadDeadline(time.Now().Add(timeout))
 				n, remoteAddr, err := s.Conn.ReadFromUDP(buffer)
 
 				if err != nil {
