@@ -2,9 +2,11 @@ package main
 
 import (
 	"fmt"
-	"github.com/spf13/cobra"
 	"log"
+	"math/rand"
 	"time"
+
+	"github.com/spf13/cobra"
 )
 
 const VERSION = "2.0.0"
@@ -14,48 +16,33 @@ var (
 	timeout  int
 	localIP  string
 	remoteIP string
-
-	// Punch configuration flags
-	maxRetries    int
-	maxPorts      int
-	punchTimeout  int
-	punchInterval int
-	messageSize   int
 )
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	rand.Seed(time.Now().UnixNano())
 
 	var rootCmd = &cobra.Command{
 		Use:   "udpholepunch",
 		Short: "UDP hole punching tool",
 		Long: `A UDP hole punching tool for establishing peer-to-peer connections.
 Example usage:
-  First find your public IP:
-  $ curl ipinfo.io
+  First run the server:
+  $ udpholepunch server --local :4500
 
-  Run as server:
-  $ udpholepunch server --local :4500 --remote 1.2.3.4:4500
+  Then run clients with server's public IP:
+  $ udpholepunch client --local :4500 --remote server-ip:4500
 
-  Run as client:
-  $ udpholepunch client --local :4500 --remote 5.6.7.8:4500
-
-Advanced usage with custom punch parameters:
-  $ udpholepunch server --local :4500 --remote 1.2.3.4:4500 \
-    --max-retries 200 --max-ports 20 --punch-timeout 3000 \
-    --punch-interval 100 --message-size 2048`,
+Each client will:
+1. Register with the server
+2. Get a list of other peers
+3. Attempt hole punching with each peer
+4. Establish direct P2P connections`,
 	}
 
 	// Global flags
 	rootCmd.PersistentFlags().BoolVarP(&debug, "debug", "d", false, "enable debug logging")
 	rootCmd.PersistentFlags().IntVarP(&timeout, "timeout", "t", 30, "connection timeout in seconds")
-
-	// Punch configuration flags
-	rootCmd.PersistentFlags().IntVar(&maxRetries, "max-retries", 100, "maximum number of punch attempts")
-	rootCmd.PersistentFlags().IntVar(&maxPorts, "max-ports", 10, "number of ports to try around target")
-	rootCmd.PersistentFlags().IntVar(&punchTimeout, "punch-timeout", 2000, "timeout for each punch attempt in milliseconds")
-	rootCmd.PersistentFlags().IntVar(&punchInterval, "punch-interval", 200, "interval between punch attempts in milliseconds")
-	rootCmd.PersistentFlags().IntVar(&messageSize, "message-size", 1024, "size of message buffer in bytes")
 
 	// Server command
 	var serverCmd = &cobra.Command{
@@ -68,19 +55,11 @@ Advanced usage with custom punch parameters:
 				RemoteAddr: remoteIP,
 				Timeout:    timeout,
 				Debug:      debug,
-				Punch: PunchConfig{
-					MaxRetries:    maxRetries,
-					MaxPorts:      maxPorts,
-					PunchTimeout:  time.Duration(punchTimeout) * time.Millisecond,
-					PunchInterval: time.Duration(punchInterval) * time.Millisecond,
-					MessageSize:   messageSize,
-				},
+				ID:         rand.Intn(10000), // Random ID for this instance
 			}
 
-			log.Printf("Starting server with configuration:")
-			logPunchConfig(conf.Punch)
-
-			if err := runImprovedServer(conf); err != nil {
+			log.Printf("Starting UDP hole punch server on %s", localIP)
+			if err := runServer(conf); err != nil {
 				log.Fatalf("Server error: %v", err)
 			}
 		},
@@ -97,19 +76,14 @@ Advanced usage with custom punch parameters:
 				RemoteAddr: remoteIP,
 				Timeout:    timeout,
 				Debug:      debug,
-				Punch: PunchConfig{
-					MaxRetries:    maxRetries,
-					MaxPorts:      maxPorts,
-					PunchTimeout:  time.Duration(punchTimeout) * time.Millisecond,
-					PunchInterval: time.Duration(punchInterval) * time.Millisecond,
-					MessageSize:   messageSize,
-				},
+				ID:         rand.Intn(10000), // Random ID for this instance
 			}
 
-			log.Printf("Starting client with configuration:")
-			logPunchConfig(conf.Punch)
+			log.Printf("Starting UDP hole punch client")
+			log.Printf("Local address: %s", localIP)
+			log.Printf("Remote server: %s", remoteIP)
 
-			if err := runImprovedClient(conf); err != nil {
+			if err := runClient(conf); err != nil {
 				log.Fatalf("Client error: %v", err)
 			}
 		},
@@ -119,7 +93,11 @@ Advanced usage with custom punch parameters:
 	for _, cmd := range []*cobra.Command{serverCmd, clientCmd} {
 		cmd.Flags().StringVarP(&localIP, "local", "l", ":4500", "local address (e.g. :4500)")
 		cmd.Flags().StringVarP(&remoteIP, "remote", "r", "", "remote address (e.g. 1.2.3.4:4500)")
-		cmd.MarkFlagRequired("remote")
+
+		// Server doesn't require remote address
+		if cmd != serverCmd {
+			cmd.MarkFlagRequired("remote")
+		}
 	}
 
 	rootCmd.AddCommand(serverCmd, clientCmd)
@@ -129,12 +107,4 @@ Advanced usage with custom punch parameters:
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatal(err)
 	}
-}
-
-func logPunchConfig(config PunchConfig) {
-	log.Printf("🔧 Max Retries: %d", config.MaxRetries)
-	log.Printf("🔧 Max Ports: %d (±%d around target)", config.MaxPorts*2, config.MaxPorts)
-	log.Printf("🔧 Punch Timeout: %v", config.PunchTimeout)
-	log.Printf("🔧 Punch Interval: %v", config.PunchInterval)
-	log.Printf("🔧 Message Size: %d bytes", config.MessageSize)
 }
