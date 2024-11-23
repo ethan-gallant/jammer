@@ -65,7 +65,7 @@ func (s *PunchSession) handleRegistration(clients *sync.Map) error {
 	buffer := make([]byte, 4096)
 	s.Conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
-	n, addr, err := s.Conn.ReadFromUDP(buffer)
+	n, _, err := s.Conn.ReadFromUDP(buffer)
 	if err != nil {
 		return fmt.Errorf("failed to receive peer list: %v", err)
 	}
